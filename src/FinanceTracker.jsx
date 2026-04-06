@@ -1,4 +1,6 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { db } from "./firebase";
+import { collection, doc, setDoc, deleteDoc, onSnapshot } from "firebase/firestore";
 
 const STAGES = [
   { key: "advance", label: "Аванс", pct: 0.5, color: "#3B82F6", bg: "#EFF6FF" },
@@ -10,11 +12,12 @@ const TAX_RATE = 0.08;
 const MONTHS_RU = ["Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"];
 const MONTHS_SHORT = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
 const RUB = " руб.";
+const COLLECTION = "projects";
 
-const newPayment = () => ({ id: Date.now() + Math.random(), amount: "", date: "", payType: "cash" });
+const newPayment = () => ({ id: String(Date.now()) + String(Math.random()).slice(2, 6), amount: "", date: "", payType: "cash" });
 
 const emptyProject = () => ({
-  id: Date.now(),
+  id: String(Date.now()),
   client: "",
   area: "",
   priceMode: "perM2",
@@ -32,6 +35,24 @@ const fmt = (n) => {
   return Math.round(n).toLocaleString("ru-RU");
 };
 
+/* ── Firebase helpers ── */
+const saveProject = async (project) => {
+  try {
+    await setDoc(doc(db, COLLECTION, project.id), project);
+  } catch (e) {
+    console.error("Save error:", e);
+  }
+};
+
+const deleteProjectFromDB = async (id) => {
+  try {
+    await deleteDoc(doc(db, COLLECTION, id));
+  } catch (e) {
+    console.error("Delete error:", e);
+  }
+};
+
+/* ── Small components ── */
 const Chip = ({ active, label, onClick, activeColor, activeBg }) => (
   <button onClick={onClick} style={{
     padding: "4px 10px", borderRadius: 6, border: "none", cursor: "pointer",
@@ -96,6 +117,7 @@ const ResultBox = ({ label, value }) => (
   </div>
 );
 
+/* ── Calc helpers ── */
 const getTotal = (p) => {
   const area = parseFloat(p.area);
   if (p.priceMode === "perM2") { const ppm = parseFloat(p.pricePerM2); return area && ppm ? area * ppm : null; }
@@ -106,66 +128,103 @@ const getCalc = (p) => {
   if (p.priceMode === "total") { const t = parseFloat(p.totalPrice); return area && t ? t / area : null; }
   return parseFloat(p.pricePerM2) || null;
 };
-
-const getStagePaid = (p, sk) => {
-  return p.stages[sk].payments.reduce((s, pay) => s + (parseFloat(pay.amount) || 0), 0);
-};
-
-const getStageTaxFromPayments = (p, sk) => {
-  return p.stages[sk].payments.reduce((s, pay) => {
-    const amt = parseFloat(pay.amount) || 0;
-    return s + (pay.payType === "bank" ? amt * TAX_RATE : 0);
-  }, 0);
-};
-
+const getStagePaid = (p, sk) => p.stages[sk].payments.reduce((s, pay) => s + (parseFloat(pay.amount) || 0), 0);
+const getStageTaxFromPayments = (p, sk) => p.stages[sk].payments.reduce((s, pay) => {
+  const amt = parseFloat(pay.amount) || 0;
+  return s + (pay.payType === "bank" ? amt * TAX_RATE : 0);
+}, 0);
 const getTotalPaid = (p) => STAGES.reduce((s, x) => s + getStagePaid(p, x.key), 0);
 const getTotalTax = (p) => STAGES.reduce((s, x) => s + getStageTaxFromPayments(p, x.key), 0);
 const getTotalNet = (p) => getTotalPaid(p) - getTotalTax(p);
 
+/* ════════════════════ MAIN ════════════════════ */
 export default function FinanceTracker() {
-  const [projects, setProjects] = useState([emptyProject()]);
+  const [projects, setProjects] = useState([]);
   const [expandedId, setExpandedId] = useState(null);
   const [tab, setTab] = useState("projects");
   const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
+  const [loading, setLoading] = useState(true);
+  const [syncStatus, setSyncStatus] = useState("loaded");
+  const saveTimers = useRef({});
+
+  /* ── Load from Firestore (realtime) ── */
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, COLLECTION), (snapshot) => {
+      const data = snapshot.docs.map((d) => d.data());
+      data.sort((a, b) => Number(a.id) - Number(b.id));
+      setProjects(data);
+      setLoading(false);
+    }, (err) => {
+      console.error("Firestore listen error:", err);
+      setLoading(false);
+    });
+    return () => unsub();
+  }, []);
+
+  /* ── Debounced save ── */
+  const debouncedSave = useCallback((project) => {
+    setSyncStatus("saving");
+    if (saveTimers.current[project.id]) clearTimeout(saveTimers.current[project.id]);
+    saveTimers.current[project.id] = setTimeout(() => {
+      saveProject(project).then(() => setSyncStatus("saved"));
+    }, 800);
+  }, []);
+
+  const updateProject = useCallback((id, updater) => {
+    setProjects((prev) => {
+      const next = prev.map((p) => {
+        if (p.id !== id) return p;
+        const updated = typeof updater === "function" ? updater(p) : { ...p, ...updater };
+        debouncedSave(updated);
+        return updated;
+      });
+      return next;
+    });
+  }, [debouncedSave]);
 
   const update = useCallback((id, f, v) => {
-    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, [f]: v } : p)));
-  }, []);
+    updateProject(id, (p) => ({ ...p, [f]: v }));
+  }, [updateProject]);
 
   const updateStageField = useCallback((id, sk, f, v) => {
-    setProjects((prev) => prev.map((p) =>
-      p.id === id ? { ...p, stages: { ...p.stages, [sk]: { ...p.stages[sk], [f]: v } } } : p
-    ));
-  }, []);
+    updateProject(id, (p) => ({ ...p, stages: { ...p.stages, [sk]: { ...p.stages[sk], [f]: v } } }));
+  }, [updateProject]);
 
   const updatePayment = useCallback((projectId, sk, payId, field, value) => {
-    setProjects((prev) => prev.map((p) => {
-      if (p.id !== projectId) return p;
-      const payments = p.stages[sk].payments.map((pay) =>
-        pay.id === payId ? { ...pay, [field]: value } : pay
-      );
+    updateProject(projectId, (p) => {
+      const payments = p.stages[sk].payments.map((pay) => pay.id === payId ? { ...pay, [field]: value } : pay);
       return { ...p, stages: { ...p.stages, [sk]: { ...p.stages[sk], payments } } };
-    }));
-  }, []);
+    });
+  }, [updateProject]);
 
   const addPayment = useCallback((projectId, sk) => {
-    setProjects((prev) => prev.map((p) => {
-      if (p.id !== projectId) return p;
-      return { ...p, stages: { ...p.stages, [sk]: { ...p.stages[sk], payments: [...p.stages[sk].payments, newPayment()] } } };
+    updateProject(projectId, (p) => ({
+      ...p, stages: { ...p.stages, [sk]: { ...p.stages[sk], payments: [...p.stages[sk].payments, newPayment()] } }
     }));
-  }, []);
+  }, [updateProject]);
 
   const removePayment = useCallback((projectId, sk, payId) => {
-    setProjects((prev) => prev.map((p) => {
-      if (p.id !== projectId) return p;
+    updateProject(projectId, (p) => {
       const payments = p.stages[sk].payments.filter((pay) => pay.id !== payId);
       return { ...p, stages: { ...p.stages, [sk]: { ...p.stages[sk], payments: payments.length ? payments : [newPayment()] } } };
-    }));
-  }, []);
+    });
+  }, [updateProject]);
 
-  const addProject = () => { const np = emptyProject(); setProjects((prev) => [...prev, np]); setExpandedId(np.id); setTab("projects"); };
-  const removeProject = (id) => { setProjects((prev) => prev.filter((p) => p.id !== id)); if (expandedId === id) setExpandedId(null); };
+  const addProject = () => {
+    const np = emptyProject();
+    setProjects((prev) => [...prev, np]);
+    saveProject(np);
+    setExpandedId(np.id);
+    setTab("projects");
+  };
 
+  const removeProject = (id) => {
+    setProjects((prev) => prev.filter((p) => p.id !== id));
+    deleteProjectFromDB(id);
+    if (expandedId === id) setExpandedId(null);
+  };
+
+  /* ── Aggregates ── */
   const grandTotal = projects.reduce((s, p) => s + (getTotal(p) || 0), 0);
   const grandPaid = projects.reduce((s, p) => s + getTotalPaid(p), 0);
   const grandTax = projects.reduce((s, p) => s + getTotalTax(p), 0);
@@ -173,10 +232,10 @@ export default function FinanceTracker() {
   const docsCount = projects.reduce((s, p) => s + STAGES.filter((x) => p.stages[x.key].docsDone).length, 0);
   const totalStages = projects.length * 3;
 
+  /* ── Monthly data ── */
   const monthlyData = useMemo(() => {
     const months = {};
     projects.forEach((p) => {
-      const total = getTotal(p);
       STAGES.forEach((s) => {
         p.stages[s.key].payments.forEach((pay) => {
           const amt = parseFloat(pay.amount) || 0;
@@ -190,36 +249,41 @@ export default function FinanceTracker() {
           months[key].tax += tax;
           months[key].net += amt - tax;
           if (pay.payType === "cash") months[key].cash += amt; else months[key].bank += amt;
-          months[key].payments.push({
-            client: p.client || "Без названия",
-            stage: s.label,
-            amt, tax, net: amt - tax,
-            payType: pay.payType,
-            date: pay.date,
-          });
+          months[key].payments.push({ client: p.client || "Без названия", stage: s.label, amt, tax, net: amt - tax, payType: pay.payType, date: pay.date });
         });
       });
     });
     return Object.values(months).sort((a, b) => a.year === b.year ? a.month - b.month : a.year - b.year);
   }, [projects]);
 
-  const years = useMemo(() => {
-    const s = new Set(monthlyData.map((m) => m.year));
-    s.add(new Date().getFullYear());
-    return [...s].sort();
-  }, [monthlyData]);
-
+  const years = useMemo(() => { const s = new Set(monthlyData.map((m) => m.year)); s.add(new Date().getFullYear()); return [...s].sort(); }, [monthlyData]);
   const filteredMonths = useMemo(() => monthlyData.filter((m) => m.year === selectedYear), [monthlyData, selectedYear]);
   const yearTotal = useMemo(() => filteredMonths.reduce((a, m) => ({ gross: a.gross + m.gross, tax: a.tax + m.tax, net: a.net + m.net }), { gross: 0, tax: 0, net: 0 }), [filteredMonths]);
   const chartMax = useMemo(() => Math.max(...filteredMonths.map((m) => m.gross), 1), [filteredMonths]);
+
+  /* ── Loading screen ── */
+  if (loading) return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#F8FAFC", fontFamily: "'DM Sans','Segoe UI',system-ui,sans-serif" }}>
+      <div style={{ textAlign: "center" }}>
+        <div style={{ width: 40, height: 40, border: "4px solid #E2E8F0", borderTopColor: "#6D28D9", borderRadius: "50%", animation: "spin 0.8s linear infinite", margin: "0 auto 16px" }} />
+        <div style={{ color: "#64748B", fontWeight: 600 }}>Загрузка данных...</div>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    </div>
+  );
 
   return (
     <div style={{ minHeight: "100vh", background: "#F8FAFC", fontFamily: "'DM Sans','Segoe UI',system-ui,sans-serif", color: "#1E293B" }}>
 
       <div style={{ background: "linear-gradient(135deg,#1E1B4B 0%,#312E81 50%,#4C1D95 100%)", padding: "28px 20px 0", color: "#fff" }}>
         <div style={{ maxWidth: 920, margin: "0 auto" }}>
-          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2.5, color: "#A78BFA", marginBottom: 4, textTransform: "uppercase" }}>Дизайн интерьера</div>
-          <h1 style={{ margin: 0, fontSize: 24, fontWeight: 800, letterSpacing: -0.5 }}>Учёт финансов</h1>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: 2.5, color: "#A78BFA", textTransform: "uppercase" }}>Дизайн интерьера</div>
+            <div style={{ fontSize: 10, color: syncStatus === "saving" ? "#FDE68A" : "#86EFAC", fontWeight: 600 }}>
+              {syncStatus === "saving" ? "Сохранение..." : syncStatus === "saved" ? "Сохранено ✓" : ""}
+            </div>
+          </div>
+          <h1 style={{ margin: "4px 0 0", fontSize: 24, fontWeight: 800, letterSpacing: -0.5 }}>Учёт финансов</h1>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: 10, marginTop: 18 }}>
             {[
               { label: "Проектов", value: projects.length },
@@ -242,7 +306,7 @@ export default function FinanceTracker() {
                 padding: "10px 20px", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
                 background: tab === t.key ? "#F8FAFC" : "transparent",
                 color: tab === t.key ? "#4C1D95" : "#A78BFA",
-                borderRadius: "12px 12px 0 0", transition: "all 0.15s",
+                borderRadius: "12px 12px 0 0",
               }}>{t.label}</button>
             ))}
           </div>
@@ -253,6 +317,12 @@ export default function FinanceTracker() {
 
         {tab === "projects" && (
           <>
+            {projects.length === 0 && (
+              <div style={{ textAlign: "center", padding: "48px 20px", color: "#94A3B8" }}>
+                <div style={{ fontSize: 15, fontWeight: 700 }}>Пока нет проектов</div>
+                <div style={{ fontSize: 13, marginTop: 4 }}>Нажмите кнопку ниже, чтобы добавить первый</div>
+              </div>
+            )}
             {projects.map((p, idx) => {
               const total = getTotal(p);
               const paid = getTotalPaid(p);
@@ -315,7 +385,6 @@ export default function FinanceTracker() {
                       <div style={{ borderTop: "1px solid #F1F5F9", paddingTop: 14 }}>
                         <label style={lbl}>Клиент / Проект</label>
                         <input style={inp} placeholder="Иванов А. — квартира на Тверской" value={p.client} onChange={(e) => update(p.id, "client", e.target.value)} />
-
                         <SectionLabel>Расчёт стоимости</SectionLabel>
                         <div style={{ display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
                           <div style={{ flex: "1 1 120px" }}>
@@ -359,90 +428,65 @@ export default function FinanceTracker() {
                                 background: stageComplete ? s.bg : "#FAFAFA", borderRadius: 14, padding: "14px 16px",
                                 border: "1px solid " + (stageComplete ? s.color + "40" : "#E2E8F0"),
                               }}>
-                                {/* Stage header */}
                                 <div style={{ display: "flex", alignItems: "center", gap: 10, justifyContent: "space-between", flexWrap: "wrap", marginBottom: 10 }}>
                                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                                     <span style={{ width: 24, height: 24, borderRadius: 12, background: s.color, color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800 }}>{sIdx + 1}</span>
                                     <span style={{ fontWeight: 700, fontSize: 14 }}>{s.label}</span>
                                     <span style={{ fontSize: 11, color: "#94A3B8", fontWeight: 600, background: "#F1F5F9", borderRadius: 6, padding: "2px 7px" }}>{Math.round(s.pct * 100)}%</span>
                                   </div>
-                                  <div style={{ textAlign: "right" }}>
-                                    <div style={{ fontWeight: 800, fontSize: 16, color: stageComplete ? s.color : "#475569" }}>
-                                      {stageTarget ? fmt(stageTarget) + RUB : "—"}
-                                    </div>
+                                  <div style={{ fontWeight: 800, fontSize: 16, color: stageComplete ? s.color : "#475569" }}>
+                                    {stageTarget ? fmt(stageTarget) + RUB : "—"}
                                   </div>
                                 </div>
 
-                                {/* Progress bar */}
                                 {stageTarget && (
                                   <div style={{ marginBottom: 12 }}>
                                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                                      <span style={{ fontSize: 11, color: "#64748B", fontWeight: 600 }}>
-                                        Оплачено: {fmt(stagePaid)} из {fmt(stageTarget)}
-                                      </span>
-                                      <span style={{ fontSize: 11, fontWeight: 700, color: stageComplete ? s.color : "#64748B" }}>
-                                        {Math.round(stageProgress)}%
-                                      </span>
+                                      <span style={{ fontSize: 11, color: "#64748B", fontWeight: 600 }}>Оплачено: {fmt(stagePaid)} из {fmt(stageTarget)}</span>
+                                      <span style={{ fontSize: 11, fontWeight: 700, color: stageComplete ? s.color : "#64748B" }}>{Math.round(stageProgress)}%</span>
                                     </div>
                                     <div style={{ height: 6, borderRadius: 3, background: "#E2E8F0", overflow: "hidden" }}>
-                                      <div style={{
-                                        height: "100%", borderRadius: 3, transition: "width 0.3s",
-                                        background: stageComplete ? s.color : s.color + "99",
-                                        width: stageProgress + "%",
-                                      }} />
+                                      <div style={{ height: "100%", borderRadius: 3, transition: "width 0.3s", background: stageComplete ? s.color : s.color + "99", width: stageProgress + "%" }} />
                                     </div>
                                   </div>
                                 )}
 
-                                {/* Payments list */}
                                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                                   {st.payments.map((pay, pi) => (
                                     <div key={pay.id} style={{
                                       display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
-                                      background: "#fff", borderRadius: 10, padding: "8px 10px",
-                                      border: "1px solid #F1F5F9",
+                                      background: "#fff", borderRadius: 10, padding: "8px 10px", border: "1px solid #F1F5F9",
                                     }}>
                                       <span style={{ fontSize: 11, color: "#94A3B8", fontWeight: 700, width: 16, textAlign: "center", flexShrink: 0 }}>{pi + 1}</span>
-                                      <input
-                                        type="number" placeholder="Сумма"
-                                        value={pay.amount}
+                                      <input type="number" placeholder="Сумма" value={pay.amount}
                                         onChange={(e) => updatePayment(p.id, s.key, pay.id, "amount", e.target.value)}
-                                        style={{ ...inp, width: 110, flex: "1 1 100px", padding: "6px 10px", fontSize: 13 }}
-                                      />
-                                      <input
-                                        type="date" value={pay.date}
+                                        style={{ ...inp, width: 110, flex: "1 1 100px", padding: "6px 10px", fontSize: 13 }} />
+                                      <input type="date" value={pay.date}
                                         onChange={(e) => updatePayment(p.id, s.key, pay.id, "date", e.target.value)}
-                                        style={{ padding: "5px 8px", border: "1px solid #E2E8F0", borderRadius: 8, fontSize: 12, color: "#1E293B", background: "#fff", outline: "none", width: 130 }}
-                                      />
+                                        style={{ padding: "5px 8px", border: "1px solid #E2E8F0", borderRadius: 8, fontSize: 12, color: "#1E293B", background: "#fff", outline: "none", width: 130 }} />
                                       <div style={{ display: "flex", gap: 0, borderRadius: 6, overflow: "hidden", border: "1px solid #E2E8F0" }}>
                                         <Chip active={pay.payType === "cash"} label="Нал" onClick={() => updatePayment(p.id, s.key, pay.id, "payType", "cash")} activeColor="#059669" activeBg="#ECFDF5" />
                                         <Chip active={pay.payType === "bank"} label="Б/н" onClick={() => updatePayment(p.id, s.key, pay.id, "payType", "bank")} activeColor="#DC2626" activeBg="#FEF2F2" />
                                       </div>
                                       {pay.payType === "bank" && pay.amount && (
-                                        <span style={{ fontSize: 10, color: "#EF4444", fontWeight: 600 }}>
-                                          -{fmt((parseFloat(pay.amount) || 0) * TAX_RATE)}
-                                        </span>
+                                        <span style={{ fontSize: 10, color: "#EF4444", fontWeight: 600 }}>-{fmt((parseFloat(pay.amount) || 0) * TAX_RATE)}</span>
                                       )}
                                       <button onClick={() => removePayment(p.id, s.key, pay.id)} style={{
-                                        background: "none", border: "none", cursor: "pointer",
-                                        color: "#D1D5DB", fontSize: 16, padding: "0 4px", lineHeight: 1,
-                                      }} title="Удалить">×</button>
+                                        background: "none", border: "none", cursor: "pointer", color: "#D1D5DB", fontSize: 16, padding: "0 4px", lineHeight: 1,
+                                      }}>×</button>
                                     </div>
                                   ))}
                                 </div>
 
-                                {/* Add payment + docs */}
                                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, flexWrap: "wrap", gap: 8 }}>
                                   <button onClick={() => addPayment(p.id, s.key)} style={{
-                                    background: "none", border: "1px dashed " + s.color + "80",
-                                    borderRadius: 8, padding: "5px 12px", cursor: "pointer",
-                                    fontSize: 11, fontWeight: 700, color: s.color,
+                                    background: "none", border: "1px dashed " + s.color + "80", borderRadius: 8, padding: "5px 12px",
+                                    cursor: "pointer", fontSize: 11, fontWeight: 700, color: s.color,
                                   }}>+ Добавить оплату</button>
                                   <Toggle checked={st.docsDone} onChange={() => updateStageField(p.id, s.key, "docsDone", !st.docsDone)}
                                     color="#8B5CF6" labelOn="Закр. док ✓" labelOff="Закр. док" />
                                 </div>
 
-                                {/* Stage tax summary */}
                                 {stageTax > 0 && (
                                   <div style={{ marginTop: 8, fontSize: 11, color: "#991B1B", background: "#FEF2F2", borderRadius: 8, padding: "5px 10px", fontWeight: 600, display: "flex", gap: 14 }}>
                                     <span>Налог 8%: {fmt(stageTax) + RUB}</span>
@@ -454,7 +498,6 @@ export default function FinanceTracker() {
                           })}
                         </div>
 
-                        {/* Project footer */}
                         <div style={{ marginTop: 14, padding: "12px 14px", background: "#F8FAFC", borderRadius: 12, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
                           <div style={{ fontSize: 12, display: "flex", gap: 14, flexWrap: "wrap" }}>
                             {total && (<>
@@ -487,8 +530,7 @@ export default function FinanceTracker() {
                 {years.map((y) => (
                   <button key={y} onClick={() => setSelectedYear(y)} style={{
                     padding: "8px 18px", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
-                    background: selectedYear === y ? "#6D28D9" : "#fff",
-                    color: selectedYear === y ? "#fff" : "#64748B",
+                    background: selectedYear === y ? "#6D28D9" : "#fff", color: selectedYear === y ? "#fff" : "#64748B",
                   }}>{y}</button>
                 ))}
               </div>
@@ -526,15 +568,9 @@ export default function FinanceTracker() {
                             <div style={{
                               width: "100%", height: Math.max(h, gross > 0 ? 4 : 0), borderRadius: "6px 6px 0 0",
                               background: isNow ? "linear-gradient(180deg,#8B5CF6,#6D28D9)" : "linear-gradient(180deg,#C4B5FD,#A78BFA)",
-                              transition: "height 0.4s",
                             }} />
                             {net < gross && net > 0 && (
-                              <div style={{
-                                position: "absolute", bottom: 0, width: "100%",
-                                height: Math.max(hNet, 4),
-                                background: "rgba(16,185,129,0.3)",
-                                borderTop: "2px dashed #10B981",
-                              }} />
+                              <div style={{ position: "absolute", bottom: 0, width: "100%", height: Math.max(hNet, 4), background: "rgba(16,185,129,0.3)", borderTop: "2px dashed #10B981" }} />
                             )}
                           </div>
                         </div>
@@ -542,16 +578,6 @@ export default function FinanceTracker() {
                       </div>
                     );
                   })}
-                </div>
-                <div style={{ display: "flex", gap: 16, marginTop: 12, justifyContent: "center" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                    <div style={{ width: 12, height: 12, borderRadius: 3, background: "#A78BFA" }} />
-                    <span style={{ fontSize: 10, color: "#64748B", fontWeight: 600 }}>Доход</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                    <div style={{ width: 12, height: 12, borderRadius: 3, background: "rgba(16,185,129,0.3)", borderTop: "2px dashed #10B981" }} />
-                    <span style={{ fontSize: 10, color: "#64748B", fontWeight: 600 }}>На руки</span>
-                  </div>
                 </div>
               </div>
             )}
@@ -564,45 +590,29 @@ export default function FinanceTracker() {
             )}
 
             {[...filteredMonths].reverse().map((m) => (
-              <div key={m.year + "-" + m.month} style={{
-                background: "#fff", borderRadius: 16, marginBottom: 10,
-                border: "1px solid #E2E8F0", overflow: "hidden",
-              }}>
-                <div style={{
-                  padding: "14px 18px", display: "flex", justifyContent: "space-between",
-                  alignItems: "center", flexWrap: "wrap", gap: 8, borderBottom: "1px solid #F1F5F9",
-                }}>
+              <div key={m.year + "-" + m.month} style={{ background: "#fff", borderRadius: 16, marginBottom: 10, border: "1px solid #E2E8F0", overflow: "hidden" }}>
+                <div style={{ padding: "14px 18px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, borderBottom: "1px solid #F1F5F9" }}>
                   <div>
                     <div style={{ fontSize: 16, fontWeight: 800 }}>{MONTHS_RU[m.month]} {m.year}</div>
                     <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 2 }}>{m.payments.length} оплат(а)</div>
                   </div>
                   <div style={{ textAlign: "right" }}>
                     <div style={{ fontSize: 18, fontWeight: 800, color: "#6D28D9" }}>{fmt(m.gross) + RUB}</div>
-                    <div style={{ fontSize: 11, display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 2 }}>
-                      {m.tax > 0 && <span style={{ color: "#EF4444", fontWeight: 600 }}>налог {fmt(m.tax)}</span>}
-                      {m.tax > 0 && <span style={{ color: "#059669", fontWeight: 700 }}>на руки {fmt(m.net)}</span>}
-                    </div>
+                    {m.tax > 0 && <div style={{ fontSize: 11, marginTop: 2 }}>
+                      <span style={{ color: "#EF4444", fontWeight: 600 }}>налог {fmt(m.tax)}</span>
+                      <span style={{ color: "#059669", fontWeight: 700, marginLeft: 10 }}>на руки {fmt(m.net)}</span>
+                    </div>}
                   </div>
                 </div>
-
                 <div style={{ display: "flex", gap: 0, borderBottom: "1px solid #F1F5F9" }}>
                   {m.cash > 0 && <div style={{ flex: m.cash, padding: "8px 14px", background: "#ECFDF5" }}><span style={{ fontSize: 10, fontWeight: 700, color: "#059669" }}>Нал: {fmt(m.cash) + RUB}</span></div>}
                   {m.bank > 0 && <div style={{ flex: m.bank, padding: "8px 14px", background: "#FEF2F2" }}><span style={{ fontSize: 10, fontWeight: 700, color: "#DC2626" }}>Безнал: {fmt(m.bank) + RUB}</span></div>}
                 </div>
-
                 <div style={{ padding: "6px 0" }}>
                   {m.payments.sort((a, b) => a.date.localeCompare(b.date)).map((pay, i) => (
-                    <div key={i} style={{
-                      padding: "8px 18px", display: "flex", justifyContent: "space-between",
-                      alignItems: "center", gap: 8, fontSize: 13, flexWrap: "wrap",
-                      borderBottom: i < m.payments.length - 1 ? "1px solid #F8FAFC" : "none",
-                    }}>
+                    <div key={i} style={{ padding: "8px 18px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 13, flexWrap: "wrap", borderBottom: i < m.payments.length - 1 ? "1px solid #F8FAFC" : "none" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
-                        <span style={{
-                          fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4,
-                          background: pay.payType === "cash" ? "#ECFDF5" : "#FEF2F2",
-                          color: pay.payType === "cash" ? "#059669" : "#DC2626",
-                        }}>{pay.payType === "cash" ? "НАЛ" : "Б/Н"}</span>
+                        <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, background: pay.payType === "cash" ? "#ECFDF5" : "#FEF2F2", color: pay.payType === "cash" ? "#059669" : "#DC2626" }}>{pay.payType === "cash" ? "НАЛ" : "Б/Н"}</span>
                         <span style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pay.client}</span>
                         <span style={{ color: "#94A3B8", fontSize: 11 }}>{pay.stage}</span>
                       </div>
